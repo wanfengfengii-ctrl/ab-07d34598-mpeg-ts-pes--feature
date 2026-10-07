@@ -56,6 +56,18 @@ func (AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// pes is optional; omitted keeps the base rule set unchanged.
+	pesBounded := false
+	switch raw := r.URL.Query().Get("pes"); raw {
+	case "":
+	case "bounded":
+		pesBounded = true
+	default:
+		writeErr(http.StatusBadRequest, ErrInvalidPES,
+			`pes must be "bounded" when present`, nil, nil)
+		return
+	}
+
 	// One extra byte lets us distinguish exactly 8 MiB from a too-large body.
 	data, err := io.ReadAll(io.LimitReader(r.Body, MaxBodyBytes+1))
 	if err != nil {
@@ -69,7 +81,7 @@ func (AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	report, auditErr := Audit(data, gap)
+	report, auditErr := audit(data, gap, pesBounded)
 	if auditErr != nil {
 		var packet, pid *int
 		if auditErr.Packet >= 0 {

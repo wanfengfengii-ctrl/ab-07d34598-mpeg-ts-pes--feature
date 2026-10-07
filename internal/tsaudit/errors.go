@@ -34,6 +34,14 @@ const (
 	ErrPCRNoBase             = "TS_PCR_WITHOUT_BASE"
 	ErrPCRReversed           = "TS_PCR_REVERSED"
 	ErrPCRGapExceeded        = "TS_PCR_GAP_EXCEEDED"
+	ErrPESMissing            = "TS_PES_MISSING"
+	ErrPESStartRequired      = "TS_PES_START_REQUIRED"
+	ErrPESPrematureStart     = "TS_PES_PREMATURE_START"
+	ErrPESHeaderShort        = "TS_PES_HEADER_SHORT"
+	ErrPESBadPrefix          = "TS_PES_BAD_PREFIX"
+	ErrPESZeroLength         = "TS_PES_ZERO_LENGTH"
+	ErrPESTrailingBytes      = "TS_PES_TRAILING_BYTES"
+	ErrPESTruncated          = "TS_PES_TRUNCATED"
 	ErrInternal              = "TS_INTERNAL"
 
 	// Request-level codes (never tied to a packet).
@@ -41,6 +49,7 @@ const (
 	ErrUnsupportedMediaType = "TS_UNSUPPORTED_MEDIA_TYPE"
 	ErrMissingMaxPcrGap     = "TS_MISSING_MAX_PCR_GAP"
 	ErrInvalidMaxPcrGap     = "TS_INVALID_MAX_PCR_GAP"
+	ErrInvalidPES           = "TS_INVALID_PES"
 	ErrBodyReadFailed       = "TS_BODY_READ_FAILED"
 )
 

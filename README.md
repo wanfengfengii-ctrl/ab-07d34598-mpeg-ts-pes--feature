@@ -2,11 +2,14 @@
 
 广播监测中心在归档前用该服务核验单节目 MPEG-TS 片段，发现播放器容错通常
 掩盖的问题：节目表损坏、丢包（连续计数断裂）、加扰、传输错误、不连续标志、
-PCR 时间线倒退或间隔超限。
+PCR 时间线倒退或间隔超限；启用 `pes=bounded` 时还核验有界 PES 完整封装，
+避免连续计数正常但截断或串接的音视频访问单元进入归档。
 
-- `POST /api/mpegts/audit?maxPcrGapMs=<1..10000>`
+- `POST /api/mpegts/audit?maxPcrGapMs=<1..10000>[&pes=bounded]`
 - 请求体：`Content-Type: application/octet-stream`，原始 MPEG-TS，不超过 8 MiB
 - 只接受由 188 字节包组成的单节目流；任一规则失败即整体拒绝，不返回部分结果
+- `pes` 为可选参数：省略时请求、响应与接纳范围与既有行为一致；仅接受
+  `bounded`，其他取值按请求错误（400 `TS_INVALID_PES`）拒绝
 
 ## 核验规则
 
@@ -23,6 +26,11 @@ PCR 时间线倒退或间隔超限。
    递增；仅适配字段包必须保持计数不变；带载荷重复同一计数视为错误。
 7. PCR 只能出现在 PMT 指定的 PCR PID 上；按 33 位基值回绕展开后不得倒退，
    相邻 PCR 间隔不得超过 `maxPcrGapMs`。
+8. 仅当 `pes=bounded` 时追加：每个 PMT 媒体 PID 至少含一条完整 PES；首个
+   载荷及每条新 PES 必须置 PUSI，载荷以 `00 00 01`、stream_id 和非零
+   PES_packet_length 开头；服务按同一 PID 的 TS 载荷跨包累计声明长度，
+   PES 必须恰好占满整数个包载荷——提前出现 PUSI、完成时同包仍有余字节、
+   完成后载荷未以 PUSI 重启、片段结尾仍欠字节，均整体拒绝。
 
 ## 成功响应
 
@@ -50,6 +58,13 @@ PCR 时间线倒退或间隔超限。
 }
 ```
 
+启用 `pes=bounded` 时，`media` 中每个媒体 PID 额外携带完整 PES 的数量
+与字节数（省略该参数时响应保持上图形状，不含这两个字段）：
+
+```json
+{ "pid": 257, "packetCount": 5, "payloadBytes": 920, "pesCount": 5, "pesBytes": 920 }
+```
+
 ## 失败响应
 
 `422 Unprocessable Entity`（请求类错误为 400/413/415/405），包含包序号、
@@ -68,7 +83,10 @@ PCR 时间线倒退或间隔超限。
 `TS_TRANSPORT_ERROR`、`TS_SCRAMBLED`、`TS_DISCONTINUITY_FLAG`、
 `TS_MULTI_PROGRAM`、`TS_SECTION_CRC`、`TS_CC_GAP`、
 `TS_CC_DUPLICATE_WITH_PAYLOAD`、`TS_PCR_ON_WRONG_PID`、
-`TS_PCR_REVERSED`、`TS_PCR_GAP_EXCEEDED` 等）。
+`TS_PCR_REVERSED`、`TS_PCR_GAP_EXCEEDED`，以及 `pes=bounded` 专用的
+`TS_PES_MISSING`、`TS_PES_START_REQUIRED`、`TS_PES_PREMATURE_START`、
+`TS_PES_HEADER_SHORT`、`TS_PES_BAD_PREFIX`、`TS_PES_ZERO_LENGTH`、
+`TS_PES_TRAILING_BYTES`、`TS_PES_TRUNCATED` 等）。
 
 ## 本地开发（仅需 Go 1.23+）
 
@@ -90,7 +108,8 @@ HEALTHCHECK），`verify` target 携带完整源码与工具链用于一次性�
 # 启动服务，宿主机端口可通过 HOST_PORT 配置
 HOST_PORT=9090 docker compose up -d app
 
-# 一次性核验服务：等待 app 健康后运行代码测试、应用构建及合法/异常流冒烟，
+# 一次性核验服务：等待 app 健康后运行代码测试、应用构建及合法/异常流冒烟
+# （含 pes=bounded 的跨包合法 PES、提前重启与截断流用例），
 # 以退出码报告结果并自行退出（可在清洁环境反复重跑）
 docker compose run --build --rm verify
 echo "exit code: $?"

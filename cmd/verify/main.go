@@ -110,7 +110,9 @@ func buildApp() error {
 	if err != nil {
 		return err
 	}
-	build := exec.Command("go", "build", "-o", out, "./cmd/server")
+	// -buildvcs=false keeps the one-shot build independent of git metadata,
+	// which may be unreadable (ownership) in some checkouts.
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", out, "./cmd/server")
 	build.Stdout = os.Stdout
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
@@ -185,8 +187,8 @@ func smokeCases(base string) []check {
 		return b.Bytes()
 	}
 
-	audit := func(body []byte, ctype string) (*http.Response, map[string]any, error) {
-		req, _ := http.NewRequest(http.MethodPost, base+"/api/mpegts/audit?maxPcrGapMs=1000", bytes.NewReader(body))
+	auditQuery := func(body []byte, ctype, query string) (*http.Response, map[string]any, error) {
+		req, _ := http.NewRequest(http.MethodPost, base+"/api/mpegts/audit?"+query, bytes.NewReader(body))
 		req.Header.Set("Content-Type", ctype)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -197,6 +199,10 @@ func smokeCases(base string) []check {
 		var decoded map[string]any
 		_ = json.Unmarshal(raw, &decoded)
 		return resp, decoded, nil
+	}
+
+	audit := func(body []byte, ctype string) (*http.Response, map[string]any, error) {
+		return auditQuery(body, ctype, "maxPcrGapMs=1000")
 	}
 
 	expectStatus := func(resp *http.Response, want int) error {
@@ -234,6 +240,99 @@ func smokeCases(base string) []check {
 					return fmt.Errorf("payloadBytes=%v", rep["payloadBytes"])
 				}
 				return nil
+			},
+		},
+		{
+			name: "bounded PES across packets accepted with PES accounting",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				for i := 0; i < 3; i++ {
+					b.AddPCR(b.Opt.PCRPID, int64(i)*40*27000)
+					b.AddPES(b.Opt.Media[0].PID, 0xE0, 400) // 406 bytes over 3 packets
+					b.AddPES(b.Opt.Media[1].PID, 0xC0, 200) // 206 bytes over 2 packets
+				}
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusOK); err != nil {
+					return err
+				}
+				if body["ok"] != true {
+					return fmt.Errorf("ok=%v", body["ok"])
+				}
+				media := body["report"].(map[string]any)["media"].([]any)
+				want := []struct{ count, bytes float64 }{{3, 3 * 406}, {3, 3 * 206}}
+				for i, m := range media {
+					entry := m.(map[string]any)
+					if entry["pesCount"].(float64) != want[i].count || entry["pesBytes"].(float64) != want[i].bytes {
+						return fmt.Errorf("media[%d] pesCount=%v pesBytes=%v, want %v",
+							i, entry["pesCount"], entry["pesBytes"], want[i])
+					}
+				}
+				return nil
+			},
+		},
+		{
+			name: "legacy stream without PES rejected when pes=bounded",
+			fn: func() error {
+				resp, body, err := auditQuery(good(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCode(body, "TS_PES_START_REQUIRED", 3)
+			},
+		},
+		{
+			name: "premature PES restart rejected",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				b.AddPCR(b.Opt.PCRPID, 0)
+				b.AddPESStart(b.Opt.Media[0].PID, 0xE0, 400) // owes 222 more bytes
+				b.AddPESStart(b.Opt.Media[0].PID, 0xE0, 400) // PUSI one packet early
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCode(body, "TS_PES_PREMATURE_START", 4)
+			},
+		},
+		{
+			name: "truncated PES stream rejected",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				b.AddPCR(b.Opt.PCRPID, 0)
+				b.AddPESStart(b.Opt.Media[0].PID, 0xE0, 400) // stream ends owing 222 bytes
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCode(body, "TS_PES_TRUNCATED", 3)
+			},
+		},
+		{
+			name: "invalid pes parameter rejected",
+			fn: func() error {
+				resp, body, err := auditQuery(good(), "application/octet-stream", "maxPcrGapMs=1000&pes=full")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusBadRequest); err != nil {
+					return err
+				}
+				return expectCodeAnyPacket(body, "TS_INVALID_PES")
 			},
 		},
 		{

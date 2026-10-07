@@ -184,6 +184,63 @@ func (b *Builder) AddPayload(pid int) *Builder {
 	return b
 }
 
+// AddPES emits one complete bounded PES: 00 00 01 prefix, streamID, declared
+// PES_packet_length = bodyLen, then bodyLen pattern bytes. The PES is
+// fragmented across as many TS packets as needed; the final fragment carries
+// an adaptation field so the PES ends exactly at the packet payload end.
+func (b *Builder) AddPES(pid int, streamID byte, bodyLen int) *Builder {
+	pes := make([]byte, 6+bodyLen)
+	pes[0], pes[1], pes[2], pes[3] = 0x00, 0x00, 0x01, streamID
+	pes[4] = byte(bodyLen >> 8)
+	pes[5] = byte(bodyLen)
+	for i := 6; i < len(pes); i++ {
+		pes[i] = byte(i*13 + pid)
+	}
+	first := true
+	for len(pes) > 0 {
+		pkt := make([]byte, PacketSize)
+		if len(pes) >= 184 {
+			copy(pkt, b.header(pid, first, 0x10, b.nextCC(pid)))
+			copy(pkt[4:], pes[:184])
+			pes = pes[184:]
+		} else {
+			// An adaptation field shrinks the payload so the PES ends
+			// exactly at the packet end.
+			adLen := 183 - len(pes)
+			copy(pkt, b.header(pid, first, 0x30, b.nextCC(pid)))
+			pkt[4] = byte(adLen)
+			if adLen > 0 {
+				pkt[5] = 0x00 // adaptation flags
+				for i := 6; i < 5+adLen; i++ {
+					pkt[i] = 0xFF
+				}
+			}
+			copy(pkt[5+adLen:], pes)
+			pes = nil
+		}
+		first = false
+		b.out = append(b.out, pkt...)
+	}
+	return b
+}
+
+// AddPESStart emits only the first fragment of a PES declaring
+// declaredBodyLen body bytes: a PUSI packet with a full 184-byte payload.
+// The PES stays incomplete unless matching continuation packets follow, so
+// this is the building block for premature-restart and truncation cases.
+func (b *Builder) AddPESStart(pid int, streamID byte, declaredBodyLen int) *Builder {
+	pkt := make([]byte, PacketSize)
+	copy(pkt, b.header(pid, true, 0x10, b.nextCC(pid)))
+	pkt[4], pkt[5], pkt[6], pkt[7] = 0x00, 0x00, 0x01, streamID
+	pkt[8] = byte(declaredBodyLen >> 8)
+	pkt[9] = byte(declaredBodyLen)
+	for i := 10; i < PacketSize; i++ {
+		pkt[i] = byte(i*13 + pid)
+	}
+	b.out = append(b.out, pkt...)
+	return b
+}
+
 // AddPCR emits a packet carrying adaptation (PCR) plus payload.
 // pcr27 is in 27 MHz units; flags other than PCR are left clear.
 func (b *Builder) AddPCR(pid int, pcr27 int64) *Builder {

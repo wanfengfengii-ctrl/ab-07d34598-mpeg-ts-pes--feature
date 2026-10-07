@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"mpegtsaudit/internal/tsaudit"
+	"mpegtsaudit/internal/tsbuild"
 )
 
 func doAudit(t *testing.T, body []byte, query, ctype string) (int, map[string]any) {
@@ -99,6 +100,73 @@ func TestHTTPWrongContentType(t *testing.T) {
 	status, _ := doAudit(t, validFragment(), "maxPcrGapMs=1000", "text/plain")
 	if status != http.StatusUnsupportedMediaType {
 		t.Fatalf("status=%d", status)
+	}
+}
+
+func TestHTTPPESInvalidValue(t *testing.T) {
+	for _, q := range []string{"pes=strict", "pes=Bounded"} {
+		status, body := doAudit(t, validFragment(), "maxPcrGapMs=1000&"+q, "application/octet-stream")
+		if status != http.StatusBadRequest {
+			t.Fatalf("%s: status=%d body=%v", q, status, body)
+		}
+		if body["error"].(map[string]any)["code"] != tsaudit.ErrInvalidPES {
+			t.Fatalf("%s: body=%v", q, body)
+		}
+	}
+}
+
+func TestHTTPPESBoundedSuccess(t *testing.T) {
+	status, body := doAudit(t, boundedFragment(), "maxPcrGapMs=1000&pes=bounded", "application/octet-stream")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	media := body["report"].(map[string]any)["media"].([]any)
+	m0 := media[0].(map[string]any)
+	if m0["pesCount"].(float64) != 1 || m0["pesBytes"].(float64) != 406 {
+		t.Fatalf("video PES fields wrong: %v", m0)
+	}
+	m1 := media[1].(map[string]any)
+	if m1["pesCount"].(float64) != 1 || m1["pesBytes"].(float64) != 206 {
+		t.Fatalf("audio PES fields wrong: %v", m1)
+	}
+}
+
+func TestHTTPPESOmittedKeepsBaseShape(t *testing.T) {
+	status, body := doAudit(t, validFragment(), "maxPcrGapMs=1000", "application/octet-stream")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	media := body["report"].(map[string]any)["media"].([]any)
+	for _, m := range media {
+		entry := m.(map[string]any)
+		if _, ok := entry["pesCount"]; ok {
+			t.Fatalf("pesCount must be absent without pes=bounded: %v", entry)
+		}
+		if _, ok := entry["pesBytes"]; ok {
+			t.Fatalf("pesBytes must be absent without pes=bounded: %v", entry)
+		}
+	}
+}
+
+func TestHTTPPESBoundedRejectsTruncated(t *testing.T) {
+	b := tsbuild.New()
+	b.AddPAT()
+	b.AddPMT()
+	b.AddPCR(b.Opt.PCRPID, 0)
+	b.AddPESStart(b.Opt.Media[0].PID, 0xE0, 400)
+	status, body := doAudit(t, b.Bytes(), "maxPcrGapMs=1000&pes=bounded", "application/octet-stream")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	errObj := body["error"].(map[string]any)
+	if errObj["code"] != tsaudit.ErrPESTruncated {
+		t.Fatalf("code=%v", errObj["code"])
+	}
+	if body["packet"].(float64) != 3 || body["pid"].(float64) != 0x0101 {
+		t.Fatalf("location wrong: %v", body)
+	}
+	if _, ok := body["report"]; ok {
+		t.Fatal("partial report must not be returned on failure")
 	}
 }
 
