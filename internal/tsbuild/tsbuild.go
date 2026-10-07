@@ -184,6 +184,63 @@ func (b *Builder) AddPayload(pid int) *Builder {
 	return b
 }
 
+// PESBytes assembles one bounded PES packet: the 00 00 01 start code prefix,
+// streamID and a non-zero PES_packet_length of pesPayloadLen, followed by a
+// deterministic payload pattern. The returned slice is the whole PES.
+func PESBytes(streamID byte, pesPayloadLen int) []byte {
+	if pesPayloadLen < 1 || pesPayloadLen > 0xFFFF {
+		panic("PES_packet_length must be in 1..65535")
+	}
+	pes := []byte{0x00, 0x00, 0x01, streamID, byte(pesPayloadLen >> 8), byte(pesPayloadLen)}
+	for i := 0; i < pesPayloadLen; i++ {
+		pes = append(pes, byte(i*7+int(streamID)))
+	}
+	return pes
+}
+
+// AddPayloadChunk emits one packet on pid carrying data as its payload.
+// pusi marks a payload-unit start. When data is shorter than the 184-byte
+// payload capacity an adaptation field pads the packet, so the payload is
+// exactly data; longer payloads are rejected.
+func (b *Builder) AddPayloadChunk(pid int, pusi bool, data []byte) *Builder {
+	if len(data) > PacketSize-4 {
+		panic("payload chunk exceeds one TS packet")
+	}
+	pkt := make([]byte, PacketSize)
+	if len(data) == PacketSize-4 {
+		copy(pkt, b.header(pid, pusi, 0x10, b.nextCC(pid)))
+		copy(pkt[4:], data)
+	} else {
+		copy(pkt, b.header(pid, pusi, 0x30, b.nextCC(pid)))
+		adLen := PacketSize - 5 - len(data)
+		pkt[4] = byte(adLen)
+		for i := 5; i < 5+adLen; i++ {
+			pkt[i] = 0xFF
+		}
+		if adLen > 0 {
+			pkt[5] = 0x00 // adaptation flags: nothing set
+		}
+		copy(pkt[5+adLen:], data)
+	}
+	b.out = append(b.out, pkt...)
+	return b
+}
+
+// AddPES emits one complete bounded PES (see PESBytes) chunked across TS
+// packets of pid: PUSI on the first packet only, and an adaptation field on
+// the final packet when needed so the PES ends exactly at a payload boundary.
+func (b *Builder) AddPES(pid int, streamID byte, pesPayloadLen int) *Builder {
+	pes := PESBytes(streamID, pesPayloadLen)
+	pusi := true
+	for len(pes) > 0 {
+		n := min(len(pes), PacketSize-4)
+		b.AddPayloadChunk(pid, pusi, pes[:n])
+		pes = pes[n:]
+		pusi = false
+	}
+	return b
+}
+
 // AddPCR emits a packet carrying adaptation (PCR) plus payload.
 // pcr27 is in 27 MHz units; flags other than PCR are left clear.
 func (b *Builder) AddPCR(pid int, pcr27 int64) *Builder {

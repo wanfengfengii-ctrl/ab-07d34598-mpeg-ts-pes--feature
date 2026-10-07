@@ -56,6 +56,20 @@ func (AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional bounded-PES audit layer: only "bounded" is a valid value; any
+	// other present value (including an empty one) is a request error.
+	pesBounded := false
+	if values, present := r.URL.Query()["pes"]; present {
+		for _, v := range values {
+			if v != "bounded" {
+				writeErr(http.StatusBadRequest, ErrInvalidPESParam,
+					`query parameter pes only accepts "bounded"`, nil, nil)
+				return
+			}
+		}
+		pesBounded = true
+	}
+
 	// One extra byte lets us distinguish exactly 8 MiB from a too-large body.
 	data, err := io.ReadAll(io.LimitReader(r.Body, MaxBodyBytes+1))
 	if err != nil {
@@ -69,7 +83,7 @@ func (AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	report, auditErr := Audit(data, gap)
+	report, auditErr := AuditPESBounded(data, gap, pesBounded)
 	if auditErr != nil {
 		var packet, pid *int
 		if auditErr.Packet >= 0 {

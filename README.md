@@ -2,11 +2,14 @@
 
 广播监测中心在归档前用该服务核验单节目 MPEG-TS 片段，发现播放器容错通常
 掩盖的问题：节目表损坏、丢包（连续计数断裂）、加扰、传输错误、不连续标志、
-PCR 时间线倒退或间隔超限。
+PCR 时间线倒退或间隔超限。可选地，还能确认片段内的有界 PES 完整封装，
+避免 TS 连续计数正常时，截断或串接的音视频访问单元仍进入归档。
 
-- `POST /api/mpegts/audit?maxPcrGapMs=<1..10000>`
+- `POST /api/mpegts/audit?maxPcrGapMs=<1..10000>[&pes=bounded]`
 - 请求体：`Content-Type: application/octet-stream`，原始 MPEG-TS，不超过 8 MiB
 - 只接受由 188 字节包组成的单节目流；任一规则失败即整体拒绝，不返回部分结果
+- `pes` 为可选参数，只接受 `bounded`；其他取值（含空值）按请求错误拒绝，
+  省略时请求、响应、错误顺序及既有接纳范围完全不变
 
 ## 核验规则
 
@@ -23,6 +26,11 @@ PCR 时间线倒退或间隔超限。
    递增；仅适配字段包必须保持计数不变；带载荷重复同一计数视为错误。
 7. PCR 只能出现在 PMT 指定的 PCR PID 上；按 33 位基值回绕展开后不得倒退，
    相邻 PCR 间隔不得超过 `maxPcrGapMs`。
+8. 仅当 `pes=bounded` 时：每个 PMT 媒体 PID 至少承载一条 PES；首个载荷及
+   每条新 PES 均须设置 PUSI，载荷以 `00 00 01`、stream_id 和非零
+   PES_packet_length 开始。按同一 PID 的 TS 载荷跨包累计声明长度：提前出现
+   PUSI、完成时同包仍有余字节、完成后载荷未以 PUSI 重启、结尾欠字节均整体
+   拒绝。
 
 ## 成功响应
 
@@ -50,6 +58,12 @@ PCR 时间线倒退或间隔超限。
 }
 ```
 
+启用 `pes=bounded` 时，每个媒体条目额外携带完整 PES 的数量与字节数：
+
+```json
+{ "pid": 257, "packetCount": 5, "payloadBytes": 920, "pesCount": 2, "pesBytes": 920 }
+```
+
 ## 失败响应
 
 `422 Unprocessable Entity`（请求类错误为 400/413/415/405），包含包序号、
@@ -68,7 +82,10 @@ PCR 时间线倒退或间隔超限。
 `TS_TRANSPORT_ERROR`、`TS_SCRAMBLED`、`TS_DISCONTINUITY_FLAG`、
 `TS_MULTI_PROGRAM`、`TS_SECTION_CRC`、`TS_CC_GAP`、
 `TS_CC_DUPLICATE_WITH_PAYLOAD`、`TS_PCR_ON_WRONG_PID`、
-`TS_PCR_REVERSED`、`TS_PCR_GAP_EXCEEDED` 等）。
+`TS_PCR_REVERSED`、`TS_PCR_GAP_EXCEEDED`、`TS_PES_NOT_FOUND`、
+`TS_PES_MISSING_PUSI`、`TS_PES_EARLY_START`、`TS_PES_HEADER_SHORT`、
+`TS_PES_BAD_PREFIX`、`TS_PES_ZERO_LENGTH`、`TS_PES_TRAILING_BYTES`、
+`TS_PES_TRUNCATED`、`TS_INVALID_PES_PARAM` 等）。
 
 ## 本地开发（仅需 Go 1.23+）
 
@@ -103,7 +120,7 @@ echo "exit code: $?"
 ```
 cmd/server/          HTTP 服务入口
 cmd/verify/          一次性核验（测试 + 构建 + 健康等待 + 冒烟）
-internal/tsaudit/    TS 解析、节目表/CC/PCR 核验、HTTP handler
+internal/tsaudit/    TS 解析、节目表/CC/PCR/有界 PES 核验、HTTP handler
 internal/tsbuild/    测试与冒烟用的最小 MPEG-TS 流构造器
 Dockerfile           runtime / verify 两个 target
 docker-compose.yml   app（端口可配 + 健康检查）与 verify（一次性）

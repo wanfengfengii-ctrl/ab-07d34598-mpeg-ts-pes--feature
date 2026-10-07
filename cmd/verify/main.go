@@ -185,8 +185,8 @@ func smokeCases(base string) []check {
 		return b.Bytes()
 	}
 
-	audit := func(body []byte, ctype string) (*http.Response, map[string]any, error) {
-		req, _ := http.NewRequest(http.MethodPost, base+"/api/mpegts/audit?maxPcrGapMs=1000", bytes.NewReader(body))
+	auditQuery := func(body []byte, ctype, query string) (*http.Response, map[string]any, error) {
+		req, _ := http.NewRequest(http.MethodPost, base+"/api/mpegts/audit?"+query, bytes.NewReader(body))
 		req.Header.Set("Content-Type", ctype)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -197,6 +197,10 @@ func smokeCases(base string) []check {
 		var decoded map[string]any
 		_ = json.Unmarshal(raw, &decoded)
 		return resp, decoded, nil
+	}
+
+	audit := func(body []byte, ctype string) (*http.Response, map[string]any, error) {
+		return auditQuery(body, ctype, "maxPcrGapMs=1000")
 	}
 
 	expectStatus := func(resp *http.Response, want int) error {
@@ -351,6 +355,93 @@ func smokeCases(base string) []check {
 					return err
 				}
 				return expectCode(body, "TS_PCR_GAP_EXCEEDED", 4)
+			},
+		},
+		{
+			name: "bounded PES spanning packets accepted",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				for i := 0; i < 3; i++ {
+					b.AddPCR(b.Opt.PCRPID, int64(i)*40*27000)
+					b.AddPES(b.Opt.Media[0].PID, 0xE0, 400) // spans 3 TS packets
+					b.AddPES(b.Opt.Media[1].PID, 0xC0, 100) // single packet
+				}
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusOK); err != nil {
+					return err
+				}
+				rep := body["report"].(map[string]any)
+				want := map[int]struct{ count, bytes float64 }{
+					b.Opt.Media[0].PID: {3, 3 * 406},
+					b.Opt.Media[1].PID: {3, 3 * 106},
+				}
+				for _, m := range rep["media"].([]any) {
+					entry := m.(map[string]any)
+					w, ok := want[int(entry["pid"].(float64))]
+					if !ok {
+						return fmt.Errorf("unexpected media pid %v", entry["pid"])
+					}
+					if entry["pesCount"].(float64) != w.count || entry["pesBytes"].(float64) != w.bytes {
+						return fmt.Errorf("pid %v: pesCount=%v pesBytes=%v, want %v/%v",
+							entry["pid"], entry["pesCount"], entry["pesBytes"], w.count, w.bytes)
+					}
+				}
+				return nil
+			},
+		},
+		{
+			name: "early PES restart rejected",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				b.AddPCR(b.Opt.PCRPID, 0)
+				hdr := tsbuild.PESBytes(0xE0, 1000) // declares 1006 bytes
+				b.AddPayloadChunk(b.Opt.Media[0].PID, true, hdr[:6])
+				b.AddPES(b.Opt.Media[0].PID, 0xE0, 20) // PUSI while bytes still owed
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCode(body, "TS_PES_EARLY_START", 4)
+			},
+		},
+		{
+			name: "truncated PES stream rejected",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				b.AddPCR(b.Opt.PCRPID, 0)
+				hdr := tsbuild.PESBytes(0xE0, 1000) // declares 1006 bytes, 6 delivered
+				b.AddPayloadChunk(b.Opt.Media[0].PID, true, hdr[:6])
+				b.AddPES(b.Opt.Media[1].PID, 0xC0, 100)
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCode(body, "TS_PES_TRUNCATED", 3)
+			},
+		},
+		{
+			name: "invalid pes parameter rejected",
+			fn: func() error {
+				resp, body, err := auditQuery(good(), "application/octet-stream", "maxPcrGapMs=1000&pes=full")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusBadRequest); err != nil {
+					return err
+				}
+				return expectCodeAnyPacket(body, "TS_INVALID_PES_PARAM")
 			},
 		},
 		{

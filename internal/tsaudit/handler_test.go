@@ -102,6 +102,83 @@ func TestHTTPWrongContentType(t *testing.T) {
 	}
 }
 
+func TestHTTPPESParamValues(t *testing.T) {
+	cases := []struct {
+		name   string
+		query  string
+		status int
+		code   string
+	}{
+		{"bounded accepted", "maxPcrGapMs=1000&pes=bounded", http.StatusOK, ""},
+		{"unknown value", "maxPcrGapMs=1000&pes=full", http.StatusBadRequest, tsaudit.ErrInvalidPESParam},
+		{"empty value", "maxPcrGapMs=1000&pes=", http.StatusBadRequest, tsaudit.ErrInvalidPESParam},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body := doAudit(t, pesFragment(), tc.query, "application/octet-stream")
+			if status != tc.status {
+				t.Fatalf("status=%d body=%v", status, body)
+			}
+			if tc.code != "" && body["error"].(map[string]any)["code"] != tc.code {
+				t.Fatalf("body=%v", body)
+			}
+		})
+	}
+}
+
+func TestHTTPPESBoundedReport(t *testing.T) {
+	status, body := doAudit(t, pesFragment(), "maxPcrGapMs=1000&pes=bounded", "application/octet-stream")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	media := body["report"].(map[string]any)["media"].([]any)
+	if len(media) != 2 {
+		t.Fatalf("media entries = %d", len(media))
+	}
+	entry := media[0].(map[string]any)
+	if entry["pesCount"].(float64) != 3 {
+		t.Errorf("pesCount = %v, want 3", entry["pesCount"])
+	}
+	if entry["pesBytes"].(float64) != 3*406 {
+		t.Errorf("pesBytes = %v, want %d", entry["pesBytes"], 3*406)
+	}
+}
+
+func TestHTTPPESOmittedKeepsLegacyShape(t *testing.T) {
+	status, body := doAudit(t, validFragment(), "maxPcrGapMs=1000", "application/octet-stream")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	media := body["report"].(map[string]any)["media"].([]any)
+	for _, m := range media {
+		entry := m.(map[string]any)
+		if _, ok := entry["pesCount"]; ok {
+			t.Errorf("pesCount must be absent without pes=bounded: %v", entry)
+		}
+		if _, ok := entry["pesBytes"]; ok {
+			t.Errorf("pesBytes must be absent without pes=bounded: %v", entry)
+		}
+	}
+}
+
+func TestHTTPPESBoundedViolation(t *testing.T) {
+	// validFragment's media packets are pattern payloads without PUSI: legal
+	// for the base audit, rejected once pes=bounded is requested.
+	status, body := doAudit(t, validFragment(), "maxPcrGapMs=1000&pes=bounded", "application/octet-stream")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["error"].(map[string]any)["code"] != tsaudit.ErrPESMissingPUSI {
+		t.Fatalf("body=%v", body)
+	}
+	if body["packet"].(float64) != 3 {
+		t.Errorf("packet = %v, want 3", body["packet"])
+	}
+	if _, ok := body["report"]; ok {
+		t.Fatal("partial report must not be returned on failure")
+	}
+}
+
 func TestHTTPTooLarge(t *testing.T) {
 	big := make([]byte, tsaudit.MaxBodyBytes+188)
 	for i := range big {

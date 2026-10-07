@@ -17,11 +17,15 @@ type PCRRef struct {
 	Value27MHz int64 `json:"value27mhz"`
 }
 
-// MediaPIDStats carries per-PID payload accounting.
+// MediaPIDStats carries per-PID payload accounting. PESCount and PESBytes
+// are only populated when the bounded-PES audit layer is enabled; they are
+// omitted from the JSON report otherwise.
 type MediaPIDStats struct {
-	PID          int   `json:"pid"`
-	PacketCount  int   `json:"packetCount"`
-	PayloadBytes int64 `json:"payloadBytes"`
+	PID          int    `json:"pid"`
+	PacketCount  int    `json:"packetCount"`
+	PayloadBytes int64  `json:"payloadBytes"`
+	PESCount     *int64 `json:"pesCount,omitempty"`
+	PESBytes     *int64 `json:"pesBytes,omitempty"`
 }
 
 // Report is the all-or-nothing success result.
@@ -47,6 +51,18 @@ type ccState struct {
 // Audit validates a raw MPEG-TS fragment. On success it returns a Report; on
 // the first violated rule it returns an AuditError and no partial results.
 func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
+	return audit(data, maxPcrGapMs, false)
+}
+
+// AuditPESBounded behaves exactly like Audit when pesBounded is false. When
+// true it additionally enforces bounded-PES framing on every PMT media PID:
+// each payload must carry complete PES packets (00 00 01 prefix, stream_id,
+// non-zero PES_packet_length) aligned to payload boundaries.
+func AuditPESBounded(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError) {
+	return audit(data, maxPcrGapMs, pesBounded)
+}
+
+func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError) {
 	if maxPcrGapMs < 1 || maxPcrGapMs > 10000 {
 		return nil, auditError(ErrInvalidMaxPcrGap, "maxPcrGapMs must be between 1 and 10000", -1, -1)
 	}
@@ -163,6 +179,12 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 	for _, pid := range mediaPIDs {
 		stats[pid] = &MediaPIDStats{PID: pid}
 	}
+	pes := map[int]*pesState{}
+	if pesBounded {
+		for _, pid := range mediaPIDs {
+			pes[pid] = &pesState{}
+		}
+	}
 
 	var firstPCR, lastPCR *PCRRef
 	var prevPCR, unwrappedPCR int64
@@ -237,10 +259,27 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 			st.PayloadBytes += b
 			payloadTotal += b
 		}
+
+		if st := pes[p.PID]; st != nil && p.HasPayload {
+			payload := data[i*packetSize+p.PayloadStart : (i+1)*packetSize]
+			if err := st.consume(payload, p.PUSI, i, p.PID); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	if pcrCount == 0 {
 		return nil, auditError(ErrNoPCR, "no PCR found on the PMT-declared PCR PID", 0, pmt.pcrPID)
+	}
+
+	// Bounded-PES end-of-stream rules: no incomplete PES may remain and every
+	// media PID must have carried at least one complete PES.
+	for _, pid := range mediaPIDs {
+		if st := pes[pid]; st != nil {
+			if err := st.finish(pid); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	duration := int64(0)
@@ -249,7 +288,13 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 	}
 	media := make([]MediaPIDStats, 0, len(mediaPIDs))
 	for _, pid := range mediaPIDs {
-		media = append(media, *stats[pid])
+		m := *stats[pid]
+		if st := pes[pid]; st != nil {
+			count, bytes := st.count, st.bytes
+			m.PESCount = &count
+			m.PESBytes = &bytes
+		}
+		media = append(media, m)
 	}
 
 	return &Report{
